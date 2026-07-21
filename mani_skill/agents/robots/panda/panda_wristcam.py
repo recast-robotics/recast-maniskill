@@ -19,7 +19,7 @@ class PandaWristCam(Panda):
     def _sensor_configs(self):
         return [
             CameraConfig(
-                uid="hand_camera",
+                uid="wrist_camera",
                 pose=sapien.Pose(p=[0, 0, 0], q=[1, 0, 0, 0]),
                 width=128,
                 height=128,
