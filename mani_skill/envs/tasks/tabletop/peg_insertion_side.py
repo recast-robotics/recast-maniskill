@@ -66,7 +66,7 @@ class PegInsertionSideEnv(BaseEnv):
     _sample_video_link = "https://github.com/mani-skillll/ManiSkill/raw/main/figures/environment_demos/PegInsertionSide-v1_rt.mp4"
     SUPPORTED_ROBOTS = ["panda_wristcam"]
     agent: Union[PandaWristCam]
-    _clearance = 0.003
+    _clearance = 0.004
     HAND_CAMERA_TILT_DEG = -40.0
     """Pitch applied to the wrist camera about its own Y axis, in degrees. The stock
     PandaWristCam hand_camera looks straight down the gripper axis, so once the peg is
@@ -246,13 +246,14 @@ class PegInsertionSideEnv(BaseEnv):
             pos = torch.zeros((b, 3))
             pos[:, :2] = xy
             pos[:, 2] = self.peg_half_sizes[env_idx, 0]
-            quat = randomization.random_quaternions(
-                b,
-                self.device,
-                lock_x=True,
-                lock_y=True,
-                bounds=(np.pi / 2 - np.pi / 8, np.pi / 2 + np.pi / 8),
-            )
+            # ReCAST: the box orientation is fixed at yaw = pi/2 (the centre of the
+            # upstream +/- pi/8 random range), so the hole axis always lies along
+            # world +y and only the box *position* randomizes. A predictable
+            # insertion axis is what makes fixed-heading teleop workable; restore
+            # upstream by swapping this for the random_quaternions call the peg uses.
+            quat = torch.zeros((b, 4))
+            quat[:, 0] = np.cos(np.pi / 4)
+            quat[:, 3] = np.sin(np.pi / 4)
             self.box.set_pose(Pose.create_from_pq(pos, quat))
 
             # Initialize the robot
