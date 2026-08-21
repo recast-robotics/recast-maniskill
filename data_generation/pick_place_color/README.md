@@ -26,6 +26,35 @@ python -m mani_skill.examples.motionplanning.panda.run \
 each worker walks forward from its own start seed on failure, so the per-process seed
 ranges overlap and a few episodes come out duplicated.
 
+### Starting part-way through the task
+
+Episodes can begin with some cubes already delivered, which is useful for weighting the
+dataset toward the later stages. The stage numbers refer to the 6-stage reward:
+
+| `start_stage` | starts with | cubes to move | reward at reset | mean episode |
+|---|---|---|---|---|
+| 1 | nothing placed (the full task) | 3 | 0 | ~305 frames |
+| 3 | red delivered | 2 | 2 | ~208 frames |
+| 5 | red and green delivered | 1 | 4 | ~109 frames |
+
+Set the mix with `start_stage_probs`, as weights over stages 1 / 3 / 5:
+
+```bash
+python -m mani_skill.examples.motionplanning.panda.run \
+    -e PickAndPlaceColor-v1 -n 600 --only-count-success -b cpu \
+    --record-dir /home/kelin/dataset/maniskill/pick_place_color --traj-name trajectory \
+    --env-kwargs '{"start_stage_probs": [0.5, 0.25, 0.25]}'
+```
+
+The stage is drawn per episode from the episode RNG, so a given seed always produces the
+same stage and the whole mix is reproducible. `reset(options={"start_stage": k})` pins it
+for a single episode and overrides the probabilities. Over 90 episodes the example above
+realised 51.1% / 25.6% / 23.3%.
+
+The chosen mix is recorded in the trajectory `.json` under `env_info.env_kwargs`, and an
+individual episode's starting stage can be recovered from its first frame by counting how
+many cubes already sit in their trays.
+
 Output: `PickAndPlaceColor-v1/motionplanning/trajectory.h5` (env states + actions,
 `obs_mode=none`, ~220 MB for 600 episodes) and the matching `.json`.
 

@@ -84,10 +84,41 @@ class PickAndPlaceColorEnv(BaseEnv):
     # Resolution of base_camera, matching the ReCAST PickCube-v1 setup.
     sensor_camera_resolution = (480, 480)
 
+    #: the stages an episode may start from, as stage numbers in the 6-stage reward.
+    #: Stage 1 is the full task; stage 3 starts with red already delivered; stage 5 with
+    #: red and green delivered. Index i pre-fills i cubes.
+    START_STAGES = (1, 3, 5)
+
     def __init__(
-        self, *args, robot_uids="panda_wristcam", robot_init_qpos_noise=0.02, **kwargs
+        self,
+        *args,
+        robot_uids="panda_wristcam",
+        robot_init_qpos_noise=0.02,
+        start_stage_probs=None,
+        **kwargs,
     ):
         self.robot_init_qpos_noise = robot_init_qpos_noise
+
+        # Mix of starting stages, as weights over START_STAGES. None (the default) means
+        # every episode is the full three-cube task. The stage is drawn per episode from
+        # the episode RNG, so a given seed always yields the same stage and the mix is
+        # reproducible. reset(options={"start_stage": k}) overrides it for one episode.
+        if start_stage_probs is not None:
+            probs = np.asarray(start_stage_probs, dtype=np.float64)
+            if probs.shape != (len(self.START_STAGES),):
+                raise ValueError(
+                    f"start_stage_probs must have {len(self.START_STAGES)} entries, one "
+                    f"per stage in {self.START_STAGES}, got {start_stage_probs}"
+                )
+            if (probs < 0).any() or probs.sum() <= 0:
+                raise ValueError(
+                    f"start_stage_probs must be non-negative and sum to more than 0, "
+                    f"got {start_stage_probs}"
+                )
+            probs = probs / probs.sum()
+        else:
+            probs = None
+        self.start_stage_probs = probs
 
         # The wrist camera is defined by the agent, not the task, so its resolution is
         # defaulted here to match base_camera. Explicit caller settings take precedence.
@@ -152,6 +183,15 @@ class PickAndPlaceColorEnv(BaseEnv):
         builder.set_initial_pose(initial_pose)
         return builder.build_kinematic(name=name)
 
+    def _cube_resting_pose_in_tray(self, tray, b: int):
+        """Pose for a cube already delivered to its tray: on the tray floor, jittered
+        inside the walls but comfortably within the placement tolerance."""
+        jitter = self.tray_inner_half_size - self.cube_half_size - 0.003
+        xyz = tray.pose.p.clone()
+        xyz[:, :2] += torch.rand((b, 2), device=self.device) * 2 * jitter - jitter
+        xyz[:, 2] = 2 * self.tray_wall_thickness + self.cube_half_size
+        return xyz
+
     def _load_scene(self, options: dict):
         self.table_scene = TableSceneBuilder(
             env=self, robot_init_qpos_noise=self.robot_init_qpos_noise
@@ -204,16 +244,45 @@ class PickAndPlaceColorEnv(BaseEnv):
                 pos[:, 2] = 0.0  # tray origin is its bottom face
                 tray.set_pose(Pose.create_from_pq(p=pos, q=[1, 0, 0, 0]))
 
+            # ------------- how many cubes are already delivered at reset -------------
+            # n_done cubes start in their trays, so the episode begins part-way through
+            # the task: 0 -> stage 1 (the full task), 1 -> stage 3, 2 -> stage 5.
+            start_stage = (options or {}).get("start_stage")
+            if start_stage is not None:
+                if start_stage not in self.START_STAGES:
+                    raise ValueError(
+                        f"start_stage must be one of {self.START_STAGES}, got "
+                        f"{start_stage}"
+                    )
+                n_done = torch.full(
+                    (b,), self.START_STAGES.index(start_stage), dtype=torch.long
+                )
+            elif self.start_stage_probs is not None:
+                cdf = common.to_tensor(
+                    np.cumsum(self.start_stage_probs), device=self.device
+                )
+                n_done = torch.searchsorted(cdf, torch.rand((b, 1))).squeeze(1)
+                n_done = n_done.clamp(max=len(self.START_STAGES) - 1).to(torch.long)
+            else:
+                n_done = torch.zeros((b,), dtype=torch.long)
+
             # ---------------- cubes: collision free uniform sampling -----------------
             sampler = randomization.UniformPlacementSampler(
                 bounds=self.cube_region, batch_size=b, device=self.device
             )
             # keep the cubes far enough apart that the gripper fingers always fit
             radius = 0.035
-            for cube in self.cubes:
+            for i, (cube, tray) in enumerate(zip(self.cubes, self.trays)):
                 xyz = torch.zeros((b, 3))
+                # sampled unconditionally so the table layout for a given seed does not
+                # shift with the starting stage
                 xyz[:, :2] = sampler.sample(radius, 100, verbose=False)
                 xyz[:, 2] = self.cube_half_size
+                # the first n_done cubes start delivered instead
+                delivered = (n_done > i).unsqueeze(1)
+                xyz = torch.where(
+                    delivered, self._cube_resting_pose_in_tray(tray, b), xyz
+                )
                 qs = randomization.random_quaternions(
                     b, lock_x=True, lock_y=True, lock_z=False
                 )

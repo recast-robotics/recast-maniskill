@@ -115,8 +115,11 @@ def _plan_grasp_pose(env, planner, cube):
     return grasp_pose
 
 
-def solve(env: PickAndPlaceColorEnv, seed=None, debug=False, vis=False):
-    env.reset(seed=seed)
+def solve(env: PickAndPlaceColorEnv, seed=None, debug=False, vis=False, options=None):
+    # options is forwarded to reset, so a caller can pin the starting stage with
+    # options={"start_stage": 3}. Left as None the env decides, which is either the full
+    # task or a draw from its start_stage_probs.
+    env.reset(seed=seed, options=options)
     assert env.unwrapped.control_mode in [
         "pd_joint_pos",
         "pd_joint_pos_vel",
@@ -141,10 +144,23 @@ def solve(env: PickAndPlaceColorEnv, seed=None, debug=False, vis=False):
     # its rest pose. The cubes do not move until they are picked, so the poses are valid
     # for the whole episode, and having the next cube's grasp in hand before the retreat
     # starts is what lets the retreat and the next approach be flown as one motion.
-    grasp_poses = [_plan_grasp_pose(env, planner, cube) for cube in env.cubes]
-    above_cubes = [
-        sapien.Pose([g.p[0], g.p[1], CARRY_HEIGHT], g.q) for g in grasp_poses
+    # Episodes can start part-way through the task, with the first cubes already sitting
+    # in their trays (see the env's start_stage_probs). Those are left alone.
+    info = env.evaluate()
+    todo = [
+        i
+        for i, color_name in enumerate(env.COLORS)
+        if not bool(info[f"is_{color_name}_placed"][0])
     ]
+    if not todo:  # already solved at reset; nothing to do
+        planner.close()
+        return env.step(env.agent.robot.get_qpos()[0, :-1].cpu().numpy())
+
+    grasp_poses = {i: _plan_grasp_pose(env, planner, env.cubes[i]) for i in todo}
+    above_cubes = {
+        i: sapien.Pose([g.p[0], g.p[1], CARRY_HEIGHT], g.q)
+        for i, g in grasp_poses.items()
+    }
 
     def approach(idx):
         """Travel to cube idx and descend onto it as one continuous motion. The old
@@ -158,11 +174,12 @@ def solve(env: PickAndPlaceColorEnv, seed=None, debug=False, vis=False):
             planner.move_to_pose_with_screw(grasp_poses[idx])
 
     res = None
-    approach(0)
-    last = len(env.cubes) - 1
-    # env.cubes and env.trays are both ordered red, green, blue, so zipping them pairs
-    # each cube with the tray of its own color
-    for i, tray in enumerate(env.trays):
+    approach(todo[0])
+    # env.cubes and env.trays are both ordered red, green, blue, so index i pairs each
+    # cube with the tray of its own color
+    for n, i in enumerate(todo):
+        tray = env.trays[i]
+        is_last = n == len(todo) - 1
         planner.close_gripper(t=GRIPPER_CLOSE_STEPS)
 
         # Lift clear of the other cubes, carry to the matching tray and lower in, all as
@@ -191,16 +208,20 @@ def solve(env: PickAndPlaceColorEnv, seed=None, debug=False, vis=False):
         # on into the next cube's approach as a single trajectory, so the arm does not
         # stop once the cube is placed. Only the last cube needs a hold at the end, since
         # the success check reads the final frame and wants every cube at rest.
-        if i == last:
+        if is_last:
             res = planner.move_to_pose_with_screw(
                 above_tray, refine_steps=FINAL_SETTLE_STEPS
             )
-        elif (
-            _chain(planner, [above_tray, above_cubes[i + 1], grasp_poses[i + 1]])
-            is None
-        ):
-            res = planner.move_to_pose_with_screw(above_tray, refine_steps=SETTLE_STEPS)
-            approach(i + 1)
+        else:
+            nxt = todo[n + 1]
+            if (
+                _chain(planner, [above_tray, above_cubes[nxt], grasp_poses[nxt]])
+                is None
+            ):
+                res = planner.move_to_pose_with_screw(
+                    above_tray, refine_steps=SETTLE_STEPS
+                )
+                approach(nxt)
 
     planner.close()
     return res
