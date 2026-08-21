@@ -32,7 +32,11 @@ RELEASE_SETTLE_STEPS = 2  # kill residual arm motion before letting go, so the c
                           # the whole pause between placing a cube and leaving for the
                           # next one, so it is kept as short as the placement tolerates.
 SETTLE_STEPS = 6         # let the cube drop the last 1.5 cm onto the tray floor
-FINAL_SETTLE_STEPS = 12  # success needs every cube static on the last frame
+# After the last cube is released the episode must end with every cube at rest, but
+# nothing requires the *arm* to be still, so instead of holding position the arm keeps
+# retreating upward while the cube settles.
+FINAL_RETREAT_HEIGHT = 0.28
+FINAL_SETTLE_STEPS = 12  # only used by the fallback path, where the arm does hold
 
 # Optional approximating B-spline over the joint path, off by default. The idea was that
 # the screw planner leaves sharp corners at the waypoints and TOPP fits an *interpolating*
@@ -270,16 +274,29 @@ def solve(env: PickAndPlaceColorEnv, seed=None, debug=False, vis=False, options=
             planner.move_to_pose_with_screw(
                 lower_into_tray, refine_steps=RELEASE_SETTLE_STEPS
             )
-        res = planner.open_gripper(t=GRIPPER_OPEN_STEPS)
+        # Release by commanding the gripper open as the retreat starts, rather than
+        # holding still for GRIPPER_OPEN_STEPS first. The retreat's own acceleration ramp
+        # leaves the arm barely moving for the first frames, so the fingers still open
+        # essentially in place, but those frames are now part of a motion instead of a
+        # dead stop. Unlike a grasp, a release does not need the arm stationary: the cube
+        # simply drops the last centimetre onto the tray floor.
+        planner.gripper_state = planner.OPEN
 
         # Retreat out of the tray. For every cube but the last that retreat runs straight
         # on into the next cube's approach as a single trajectory, so the arm does not
         # stop once the cube is placed. Only the last cube needs a hold at the end, since
         # the success check reads the final frame and wants every cube at rest.
         if is_last:
-            res = planner.move_to_pose_with_screw(
-                above_tray, refine_steps=FINAL_SETTLE_STEPS
+            # keep climbing while the last cube settles, so the episode ends on a moving
+            # arm rather than a dozen frames of held position
+            final_pose = sapien.Pose(
+                [tray_x, tray_y, FINAL_RETREAT_HEIGHT], grasp_pose.q
             )
+            res = _chain(planner, [above_tray, final_pose])
+            if res is None:
+                res = planner.move_to_pose_with_screw(
+                    above_tray, refine_steps=FINAL_SETTLE_STEPS
+                )
         else:
             nxt = todo[n + 1]
             if (
