@@ -1,5 +1,6 @@
 import numpy as np
 import sapien
+from scipy.interpolate import splev, splprep
 from transforms3d.euler import euler2quat
 
 from mani_skill.envs.tasks import PickAndPlaceColorEnv
@@ -32,6 +33,30 @@ RELEASE_SETTLE_STEPS = 2  # kill residual arm motion before letting go, so the c
                           # next one, so it is kept as short as the placement tolerates.
 SETTLE_STEPS = 6         # let the cube drop the last 1.5 cm onto the tray floor
 FINAL_SETTLE_STEPS = 12  # success needs every cube static on the last frame
+
+# Optional approximating B-spline over the joint path, off by default. The idea was that
+# the screw planner leaves sharp corners at the waypoints and TOPP fits an *interpolating*
+# spline through every one of them, so rounding the corners first should cut jerk.
+#
+# Measured, it does not, and the reason is worth recording so it is not retried: the arm's
+# jerk is set by the controller, not by the path. pd_joint_pos receives a new target every
+# control step and its PD response low-passes the command stream, so the jerk that reaches
+# the joints is about a third of the jerk in the commanded positions (p99 0.15 against
+# 0.40). Smoothing the path leaves the achieved jerk untouched -- 0.1495, 0.1497 and
+# 0.1490 at tolerances of 0, 0.005 and 0.02 -- while slightly *raising* commanded jerk
+# (0.403 -> 0.454) through resampling wiggle. Re-timing with toppra's ParametrizeSpline
+# instead of mplib's ParametrizeConstAccel makes no difference either (jerk p99 0.3099 vs
+# 0.3102 on the same path), though it does respect the acceleration limit more closely.
+#
+# What actually bounds smoothness here is the 20 Hz control rate: commands land 50ms apart
+# and each step is a fresh setpoint. Raising control_freq, or switching to
+# pd_joint_pos_vel so the controller gets a velocity feed-forward, are the real levers --
+# both change the action cadence and so the shape of the dataset.
+#
+# Left in place, and honest, for anyone who wants to experiment: set BSPLINE_TOLERANCE
+# above 0 to enable. It bounds the RMS joint-space deviation from the planned path.
+BSPLINE_TOLERANCE = 0.0  # radians RMS; 0 disables the fit
+BSPLINE_DEGREE = 5
 
 
 def _chain(planner, poses, refine_steps=0):
@@ -74,10 +99,53 @@ def _chain(planner, poses, refine_steps=0):
     if len(path) < 3:  # TOPP needs a few samples to fit a spline
         return None
 
+    path = _smooth_path(path)
     _, qs, qds, _, _ = mp.TOPP(path, planner.base_env.control_timestep)
     return planner.follow_path(
         {"position": qs, "velocity": qds}, refine_steps=refine_steps
     )
+
+
+def _smooth_path(path, tolerance=None, degree=None):
+    """Round the corners of a joint path with an approximating B-spline.
+
+    The path is parameterised by its own arc length so the fit is not skewed by samples
+    bunching where the source trajectory was slow. The first and last points carry a huge
+    weight, which pins them: a chain ends at a grasp or a release, and those have to be hit
+    exactly. Interior corners are free to round, which is the point.
+
+    Falls back to the unsmoothed path if the fit fails or would move any point further than
+    a few times the tolerance, so a bad fit can never quietly deform the trajectory.
+    """
+    tolerance = BSPLINE_TOLERANCE if tolerance is None else tolerance
+    degree = BSPLINE_DEGREE if degree is None else degree
+    n = len(path)
+    if tolerance <= 0 or n <= degree + 1:
+        return path
+
+    seg = np.linalg.norm(np.diff(path, axis=0), axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(seg)])
+    if arc[-1] <= 0:
+        return path
+    u = arc / arc[-1]
+
+    weights = np.ones(n)
+    weights[0] = weights[-1] = 1e6
+    # splprep bounds the weighted sum of squared residuals by s
+    smoothing = n * tolerance**2
+    try:
+        tck, _ = splprep(path.T, u=u, w=weights, s=smoothing, k=degree)
+        smoothed = np.stack(splev(u, tck), axis=1)
+    except Exception:
+        return path
+
+    if not np.all(np.isfinite(smoothed)):
+        return path
+    if np.abs(smoothed - path).max() > max(10 * tolerance, 0.05):
+        return path  # fit wandered; keep the planned path
+    # keep the pinned ends exact rather than merely well-weighted
+    smoothed[0], smoothed[-1] = path[0], path[-1]
+    return smoothed
 
 
 def _transit(planner, pose):
