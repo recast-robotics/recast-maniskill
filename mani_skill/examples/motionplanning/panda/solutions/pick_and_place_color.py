@@ -7,6 +7,7 @@ from mani_skill.examples.motionplanning.base_motionplanner.utils import (
     compute_grasp_info_by_obb, get_actor_obb)
 from mani_skill.examples.motionplanning.panda.motionplanner import \
     PandaArmMotionPlanningSolver
+from mani_skill.utils.structs.pose import to_sapien_pose
 
 FINGER_LENGTH = 0.025
 # height the gripper travels at between the cubes and the trays
@@ -28,6 +29,52 @@ RELEASE_SETTLE_STEPS = 4  # kill residual arm motion before letting go, so the c
                           # drops straight down instead of skidding off-centre
 SETTLE_STEPS = 6         # let the cube drop the last 1.5 cm onto the tray floor
 FINAL_SETTLE_STEPS = 12  # success needs every cube static on the last frame
+
+
+def _chain(planner, poses, refine_steps=0):
+    """Plan a sequence of poses and execute them as ONE time-parameterised trajectory.
+
+    Every move_to_pose_* call plans a trajectory that both starts and ends at zero
+    velocity, so running them back to back brings the arm to a full stop at each
+    intermediate waypoint -- most visibly at the pre-grasp pose. Planning the segments up
+    front, concatenating their joint paths and re-timing the whole path with TOPP keeps
+    the same geometry (the path is densely sampled, so the spline passes through it) but
+    decelerates only once, at the very end. Corners are rounded in time rather than cut in
+    space: TOPP slows the arm through them to respect the acceleration limit.
+
+    Returns None if any segment fails to plan, so the caller can fall back to stepping
+    through the waypoints one at a time.
+    """
+    mp = planner.planner
+    dof = len(mp.joint_vel_limits)
+    qpos = planner.robot.get_qpos().cpu().numpy()[0]
+    segments = []
+    for pose in poses:
+        pose = to_sapien_pose(pose)
+        result = mp.plan_screw(
+            np.concatenate([pose.p, pose.q]),
+            qpos,
+            time_step=planner.base_env.control_timestep,
+            use_point_cloud=planner.use_point_cloud,
+        )
+        if result["status"] != "Success":
+            return None
+        segments.append(result["position"])
+        # the next segment starts where this one ended
+        qpos = np.concatenate([result["position"][-1], qpos[dof:]])
+
+    path = np.vstack(segments)
+    # consecutive segments share an endpoint; a duplicate point is a zero-length step,
+    # which TOPP reads as a singular path derivative and crawls through
+    step = np.linalg.norm(np.diff(path, axis=0), axis=1)
+    path = path[np.concatenate([[True], step > 1e-6])]
+    if len(path) < 3:  # TOPP needs a few samples to fit a spline
+        return None
+
+    _, qs, qds, _, _ = mp.TOPP(path, planner.base_env.control_timestep)
+    return planner.follow_path(
+        {"position": qs, "velocity": qds}, refine_steps=refine_steps
+    )
 
 
 def _transit(planner, pose):
@@ -99,31 +146,37 @@ def solve(env: PickAndPlaceColorEnv, seed=None, debug=False, vis=False):
         grasp_pose = _plan_grasp_pose(env, planner, cube)
         cube_x, cube_y = grasp_pose.p[0], grasp_pose.p[1]
 
-        # Transit above the cube, then descend. The pre-grasp approach gets the
-        # RRTConnect fallback too: when its screw plan fails the cube is never picked up
-        # and the episode is silently lost.
-        _transit(planner, sapien.Pose([cube_x, cube_y, CARRY_HEIGHT], grasp_pose.q))
-        _transit(planner, grasp_pose * sapien.Pose([0, 0, -0.05]))
-
-        # Grasp
-        planner.move_to_pose_with_screw(grasp_pose)
+        # Transit above the cube and descend onto it in one continuous motion. The old
+        # intermediate pre-grasp pose was redundant -- it sat on the same vertical line as
+        # the other two, so it only added a dead stop half way down.
+        above_cube = sapien.Pose([cube_x, cube_y, CARRY_HEIGHT], grasp_pose.q)
+        if _chain(planner, [above_cube, grasp_pose]) is None:
+            # screw planning failed somewhere in the chain; fall back to separate moves,
+            # which can route around obstacles with RRTConnect
+            _transit(planner, above_cube)
+            _transit(planner, grasp_pose * sapien.Pose([0, 0, -0.05]))
+            planner.move_to_pose_with_screw(grasp_pose)
         planner.close_gripper(t=GRIPPER_CLOSE_STEPS)
 
-        # Lift clear of the other cubes and the tray walls
-        planner.move_to_pose_with_screw(
-            sapien.Pose([cube_x, cube_y, CARRY_HEIGHT], grasp_pose.q)
-        )
-
-        # Carry over to the matching tray
+        # Lift clear of the other cubes, carry to the matching tray and lower in, all as
+        # one motion. The waypoints still force the arm up to CARRY_HEIGHT before it
+        # travels sideways; it just no longer stops at the corners.
         tray_x, tray_y = tray.pose.p.cpu().numpy()[0][:2]
         above_tray = sapien.Pose([tray_x, tray_y, CARRY_HEIGHT], grasp_pose.q)
-        _transit(planner, above_tray)
-
-        # Lower into the tray and let go
-        planner.move_to_pose_with_screw(
-            sapien.Pose([tray_x, tray_y, release_z], grasp_pose.q),
-            refine_steps=RELEASE_SETTLE_STEPS,
-        )
+        lower_into_tray = sapien.Pose([tray_x, tray_y, release_z], grasp_pose.q)
+        if (
+            _chain(
+                planner,
+                [above_cube, above_tray, lower_into_tray],
+                refine_steps=RELEASE_SETTLE_STEPS,
+            )
+            is None
+        ):
+            planner.move_to_pose_with_screw(above_cube)
+            _transit(planner, above_tray)
+            planner.move_to_pose_with_screw(
+                lower_into_tray, refine_steps=RELEASE_SETTLE_STEPS
+            )
         res = planner.open_gripper(t=GRIPPER_OPEN_STEPS)
 
         # Retreat so the gripper does not knock the cube back out of the tray. Only the
