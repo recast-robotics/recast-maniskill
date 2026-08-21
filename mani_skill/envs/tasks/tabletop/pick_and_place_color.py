@@ -33,8 +33,10 @@ class PickAndPlaceColorEnv(BaseEnv):
     - every sampled position is kept inside the robot's reachable workspace
 
     **Rewards:**
-    - the sparse reward is the number of cubes currently resting in their matching tray, so it
-      ranges from 0 to 3 and goes up by 1 for each cube the robot delivers
+    - the sparse reward counts completed stages, six in all, worth one point each: pick red,
+      place red, pick green, place green, pick blue, place blue. It ranges from 0 to 6 and
+      steps up by 1 per stage. A colour's pick stage stays earned once its cube is in the
+      tray, so a finished colour is always worth 2 points
 
     **Success Conditions:**
     - each cube lies inside its matching tray (within the tray's inner walls and resting on
@@ -62,6 +64,11 @@ class PickAndPlaceColorEnv(BaseEnv):
     )
 
     cube_half_size = 0.02
+    # how far a cube must be off the table before it counts as picked, rather than merely
+    # gripped while still resting on the surface. This has to stay below the height at
+    # which a cube rests in a tray (2 * tray_wall_thickness = 1cm above the table) so that
+    # a delivered cube still reads as picked -- see _cube_picked.
+    pick_lift_height = 0.005
     # tray geometry (a shallow open-top box)
     tray_inner_half_size = 0.03  # half length of the tray's inner square (1 cm around the cube)
     tray_wall_thickness = 0.005
@@ -212,6 +219,23 @@ class PickAndPlaceColorEnv(BaseEnv):
                 )
                 cube.set_pose(Pose.create_from_pq(p=xyz, q=qs))
 
+    def _cube_picked(self, cube, is_grasped, is_placed):
+        """A cube counts as picked once it is clear of the table: held and lifted, in
+        flight after being released over a tray, or already resting in one (a tray floor
+        sits above table height).
+
+        This keys on height rather than on the grasp so the stage stays earned through the
+        release itself. For a frame or two after the gripper opens the cube is falling --
+        no longer held, not yet at rest in the tray -- and a grasp-based test would read
+        false there, dropping the reward by one every time the robot lets go and turning
+        the staircase into a sawtooth. The pick stage of a colour therefore stays earned
+        once its cube is delivered, so a finished colour is always worth its full 2
+        points."""
+        clear_of_table = (
+            cube.pose.p[..., 2] > self.cube_half_size + self.pick_lift_height
+        )
+        return (clear_of_table | is_grasped | is_placed).bool()
+
     def _cube_in_tray(self, cube, tray):
         """A cube counts as placed when it sits on the tray floor, within the tray walls,
         is at rest, and is no longer held by the robot."""
@@ -228,23 +252,38 @@ class PickAndPlaceColorEnv(BaseEnv):
 
     def evaluate(self):
         info = dict()
-        placed = []
+        placed, picked = [], []
         for (color_name, _), cube, tray in zip(
             self.COLORS.items(), self.cubes, self.trays
         ):
             is_placed, is_grasped = self._cube_in_tray(cube, tray)
+            is_picked = self._cube_picked(cube, is_grasped, is_placed)
+            info[f"is_{color_name}_picked"] = is_picked
             info[f"is_{color_name}_placed"] = is_placed
             info[f"is_{color_name}_grasped"] = is_grasped
             placed.append(is_placed)
+            picked.append(is_picked)
         info["num_placed"] = torch.stack(placed, dim=1).sum(dim=1)
+        # the six stages, in order: pick red, place red, pick green, place green,
+        # pick blue, place blue
+        info["num_stages"] = torch.stack(picked + placed, dim=1).sum(dim=1)
         info["success"] = placed[0] & placed[1] & placed[2]
         return info
 
     def compute_sparse_reward(self, obs, action: torch.Tensor, info: dict):
-        """+1 for every cube sitting in the tray of its own color, so the reward climbs
-        0 -> 1 -> 2 -> 3 as the robot works through them. Overrides the default sparse
-        reward, which would only pay out once all three are placed."""
-        return info["num_placed"].to(torch.float)
+        """The task is scored as six stages worth one point each -- pick red, place red,
+        pick green, place green, pick blue, place blue -- so the reward runs 0 to 6 and
+        steps up once per stage completed.
+
+        Picking a colour stays earned once that cube is in its tray (see _cube_picked),
+        so a completed colour is always worth its full 2 points and the reward is a
+        staircase. It is still a function of the current state rather than a latch on
+        history: knocking a placed cube back out of its tray gives the points back, which
+        is what makes the reward Markovian and safe to learn from.
+
+        Overrides the default sparse reward, which would only pay out once all three
+        cubes are placed."""
+        return info["num_stages"].to(torch.float)
 
     def _get_obs_extra(self, info: dict):
         obs = dict(tcp_pose=self.agent.tcp.pose.raw_pose)
