@@ -24,9 +24,12 @@ JOINT_ACC_LIMIT = 4.0   # rad/s^2
 # Frames spent holding still are frames a policy learns nothing from, so the dwell times
 # are only as long as the physics needs.
 GRIPPER_CLOSE_STEPS = 6  # the fingers must actually clamp before the lift
-GRIPPER_OPEN_STEPS = 4
-RELEASE_SETTLE_STEPS = 4  # kill residual arm motion before letting go, so the cube
-                          # drops straight down instead of skidding off-centre
+GRIPPER_OPEN_STEPS = 3
+RELEASE_SETTLE_STEPS = 2  # kill residual arm motion before letting go, so the cube
+                          # drops straight down instead of skidding off-centre. With the
+                          # arm holding still for this plus GRIPPER_OPEN_STEPS, this is
+                          # the whole pause between placing a cube and leaving for the
+                          # next one, so it is kept as short as the placement tolerates.
 SETTLE_STEPS = 6         # let the cube drop the last 1.5 cm onto the tray floor
 FINAL_SETTLE_STEPS = 12  # success needs every cube static on the last frame
 
@@ -134,55 +137,70 @@ def solve(env: PickAndPlaceColorEnv, seed=None, debug=False, vis=False):
     # fingers clear of the tray walls
     release_z = 2 * env.tray_wall_thickness + env.cube_half_size + 0.015
 
-    res = None
-    # env.cubes and env.trays are both ordered red, green, blue, so zipping them pairs
-    # each cube with the tray of its own color
-    for i, (cube, tray) in enumerate(zip(env.cubes, env.trays)):
-        # the gripper is already open at reset and after each release, so re-opening it
-        # would only add static frames
-        if planner.gripper_state != planner.OPEN:
-            planner.open_gripper(t=GRIPPER_OPEN_STEPS)
+    # Grasp poses for all three cubes are planned up front, while the arm is still at
+    # its rest pose. The cubes do not move until they are picked, so the poses are valid
+    # for the whole episode, and having the next cube's grasp in hand before the retreat
+    # starts is what lets the retreat and the next approach be flown as one motion.
+    grasp_poses = [_plan_grasp_pose(env, planner, cube) for cube in env.cubes]
+    above_cubes = [
+        sapien.Pose([g.p[0], g.p[1], CARRY_HEIGHT], g.q) for g in grasp_poses
+    ]
 
-        grasp_pose = _plan_grasp_pose(env, planner, cube)
-        cube_x, cube_y = grasp_pose.p[0], grasp_pose.p[1]
-
-        # Transit above the cube and descend onto it in one continuous motion. The old
-        # intermediate pre-grasp pose was redundant -- it sat on the same vertical line as
-        # the other two, so it only added a dead stop half way down.
-        above_cube = sapien.Pose([cube_x, cube_y, CARRY_HEIGHT], grasp_pose.q)
-        if _chain(planner, [above_cube, grasp_pose]) is None:
+    def approach(idx):
+        """Travel to cube idx and descend onto it as one continuous motion. The old
+        intermediate pre-grasp pose was redundant -- it sat on the same vertical line as
+        the other two, so it only added a dead stop half way down."""
+        if _chain(planner, [above_cubes[idx], grasp_poses[idx]]) is None:
             # screw planning failed somewhere in the chain; fall back to separate moves,
             # which can route around obstacles with RRTConnect
-            _transit(planner, above_cube)
-            _transit(planner, grasp_pose * sapien.Pose([0, 0, -0.05]))
-            planner.move_to_pose_with_screw(grasp_pose)
+            _transit(planner, above_cubes[idx])
+            _transit(planner, grasp_poses[idx] * sapien.Pose([0, 0, -0.05]))
+            planner.move_to_pose_with_screw(grasp_poses[idx])
+
+    res = None
+    approach(0)
+    last = len(env.cubes) - 1
+    # env.cubes and env.trays are both ordered red, green, blue, so zipping them pairs
+    # each cube with the tray of its own color
+    for i, tray in enumerate(env.trays):
         planner.close_gripper(t=GRIPPER_CLOSE_STEPS)
 
         # Lift clear of the other cubes, carry to the matching tray and lower in, all as
         # one motion. The waypoints still force the arm up to CARRY_HEIGHT before it
         # travels sideways; it just no longer stops at the corners.
+        grasp_pose = grasp_poses[i]
         tray_x, tray_y = tray.pose.p.cpu().numpy()[0][:2]
         above_tray = sapien.Pose([tray_x, tray_y, CARRY_HEIGHT], grasp_pose.q)
         lower_into_tray = sapien.Pose([tray_x, tray_y, release_z], grasp_pose.q)
         if (
             _chain(
                 planner,
-                [above_cube, above_tray, lower_into_tray],
+                [above_cubes[i], above_tray, lower_into_tray],
                 refine_steps=RELEASE_SETTLE_STEPS,
             )
             is None
         ):
-            planner.move_to_pose_with_screw(above_cube)
+            planner.move_to_pose_with_screw(above_cubes[i])
             _transit(planner, above_tray)
             planner.move_to_pose_with_screw(
                 lower_into_tray, refine_steps=RELEASE_SETTLE_STEPS
             )
         res = planner.open_gripper(t=GRIPPER_OPEN_STEPS)
 
-        # Retreat so the gripper does not knock the cube back out of the tray. Only the
-        # last cube needs a longer hold, since the success check reads the final frame.
-        settle = FINAL_SETTLE_STEPS if i == len(env.cubes) - 1 else SETTLE_STEPS
-        res = planner.move_to_pose_with_screw(above_tray, refine_steps=settle)
+        # Retreat out of the tray. For every cube but the last that retreat runs straight
+        # on into the next cube's approach as a single trajectory, so the arm does not
+        # stop once the cube is placed. Only the last cube needs a hold at the end, since
+        # the success check reads the final frame and wants every cube at rest.
+        if i == last:
+            res = planner.move_to_pose_with_screw(
+                above_tray, refine_steps=FINAL_SETTLE_STEPS
+            )
+        elif (
+            _chain(planner, [above_tray, above_cubes[i + 1], grasp_poses[i + 1]])
+            is None
+        ):
+            res = planner.move_to_pose_with_screw(above_tray, refine_steps=SETTLE_STEPS)
+            approach(i + 1)
 
     planner.close()
     return res
