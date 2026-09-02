@@ -20,7 +20,12 @@ CARRY_HEIGHT = 0.16
 # the stock 0.9 runs the arm at roughly 40% of its capability and the acceleration cap
 # is what really stretches the trajectories out. These stay under the URDF ceiling.
 JOINT_VEL_LIMIT = 1.8   # rad/s
-JOINT_ACC_LIMIT = 4.0   # rad/s^2
+# The acceleration limit is set to hold end-effector acceleration under 1 m/s^2. mplib
+# constrains joint acceleration, not Cartesian, and over this range the two are very
+# nearly proportional -- EE peak accel comes out at about 0.62x the joint limit -- so
+# 1.7 rad/s^2 lands at a measured 0.99 m/s^2. That constant is empirical, so re-check it
+# if the velocity limit or the waypoint geometry changes.
+JOINT_ACC_LIMIT = 1.7   # rad/s^2
 
 # Frames spent holding still are frames a policy learns nothing from, so the dwell times
 # are only as long as the physics needs.
