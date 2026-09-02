@@ -62,7 +62,14 @@ def parse_args():
         "preserves episode_index == traj index. stride: round-robin.",
     )
     p.add_argument("--image-writer-processes", type=int, default=0)
-    p.add_argument("--image-writer-threads", type=int, default=4)
+    # 0 means frames are written synchronously. LeRobot's async image writer queues
+    # frames in memory, and if it outruns the video encoder the backlog grows without
+    # bound: rendering 2000 episodes, one of three otherwise identical shards reached
+    # 8.8 GB RSS after 138 episodes while its siblings sat at 4.4 GB, and an earlier run
+    # had a shard OOM-killed at 9.3 GB. The growth does not track episode count, so it
+    # cannot be avoided by using smaller shards. Writing synchronously removes the queue
+    # and holds memory flat at ~3.5 GB for no measurable loss in throughput.
+    p.add_argument("--image-writer-threads", type=int, default=0)
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 

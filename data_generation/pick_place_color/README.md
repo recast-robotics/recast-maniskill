@@ -96,7 +96,7 @@ aggregate_datasets(
 )
 ```
 
-**Cap the shard count at 4 on a 30 GB machine.** Each renderer holds ~5 GB RSS, so 6
+**Cap the shard count at 4 on a 30 GB machine.** Each renderer holds ~3.5-5 GB RSS, so 6
 shards get one OOM-killed by the kernel part-way through. Always require every shard to
 print its `DONE` line before merging -- a merge over a silently truncated shard produces a
 dataset that looks valid but is missing episodes. Verify after merging:
@@ -105,6 +105,14 @@ dataset that looks valid but is missing episodes. Verify after merging:
 ds = LeRobotDataset("recast-robotics/pick-color-cube-600")
 assert ds.num_frames == sum(e["elapsed_steps"] for e in json.load(open(H5_JSON))["episodes"])
 ```
+
+**Keep `--image-writer-threads 0`** (the default). LeRobot's async image writer queues
+frames in memory and, when it outruns the video encoder, the backlog grows without bound.
+Rendering 2000 episodes, one of three otherwise identical shards reached 8.8 GB RSS after
+138 episodes while its siblings sat at 4.4 GB, and an earlier shard was OOM-killed at
+9.3 GB. Because the growth does not track episode count, smaller shards do not avoid it.
+Writing synchronously removes the queue and holds memory flat at ~3.5 GB, with no
+measurable throughput cost.
 
 `--shard-mode stride` (round-robin) is also available, but interleaves episodes across
 shards, so the merged `episode_index` no longer matches the source trajectory index.
