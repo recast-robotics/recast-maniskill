@@ -1,3 +1,4 @@
+import json
 import multiprocessing as mp
 import os
 from copy import deepcopy
@@ -9,7 +10,7 @@ from tqdm import tqdm
 import os.path as osp
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.trajectory.merge_trajectory import merge_trajectories
-from mani_skill.examples.motionplanning.panda.solutions import solvePushCube, solvePickCube, solveStackCube, solvePegInsertionSide, solvePlugCharger, solvePullCubeTool, solveLiftPegUpright, solvePullCube, solveDrawTriangle, solveDrawSVG, solvePlaceSphere, solveStackPyramid
+from mani_skill.examples.motionplanning.panda.solutions import solvePushCube, solvePickCube, solveStackCube, solvePegInsertionSide, solvePlugCharger, solvePullCubeTool, solveLiftPegUpright, solvePullCube, solveDrawTriangle, solveDrawSVG, solvePlaceSphere, solveStackPyramid, solvePickAndPlaceColor
 MP_SOLUTIONS = {
     "DrawTriangle-v1": solveDrawTriangle,
     "PickCube-v1": solvePickCube,
@@ -23,6 +24,7 @@ MP_SOLUTIONS = {
     "PullCube-v1": solvePullCube,
     "DrawSVG-v1" : solveDrawSVG,
     "StackPyramid-v1": solveStackPyramid,
+    "PickAndPlaceColor-v1": solvePickAndPlaceColor,
 }
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -38,10 +40,14 @@ def parse_args(args=None):
     parser.add_argument("--traj-name", type=str, help="The name of the trajectory .h5 file that will be created.")
     parser.add_argument("--shader", default="default", type=str, help="Change shader used for rendering. Default is 'default' which is very fast. Can also be 'rt' for ray tracing and generating photo-realistic renders. Can also be 'rt-fast' for a faster but lower quality ray-traced renderer")
     parser.add_argument("--record-dir", type=str, default="demos", help="where to save the recorded trajectories")
+    parser.add_argument("--start-seed", type=int, default=0, help="First episode seed. Give parallel invocations widely spaced start seeds so their ranges cannot overlap: a worker walks its seed forward on failure, so adjacent ranges would otherwise produce duplicate episodes.")
+    parser.add_argument("--env-kwargs", type=str, default=None, help="JSON dict of extra keyword arguments passed to gym.make, e.g. '{\"start_stage_probs\": [0.6, 0.2, 0.2]}'")
     parser.add_argument("--num-procs", type=int, default=1, help="Number of processes to use to help parallelize the trajectory replay process. This uses CPU multiprocessing and only works with the CPU simulation backend at the moment.")
     return parser.parse_args()
 
-def _main(args, proc_id: int = 0, start_seed: int = 0) -> str:
+def _main(args, proc_id: int = 0, start_seed: int = None) -> str:
+    if start_seed is None:
+        start_seed = args.start_seed
     env_id = args.env_id
     env = gym.make(
         env_id,
@@ -51,7 +57,8 @@ def _main(args, proc_id: int = 0, start_seed: int = 0) -> str:
         sensor_configs=dict(shader_pack=args.shader),
         human_render_camera_configs=dict(shader_pack=args.shader),
         viewer_camera_configs=dict(shader_pack=args.shader),
-        sim_backend=args.sim_backend
+        sim_backend=args.sim_backend,
+        **(json.loads(args.env_kwargs) if args.env_kwargs else {}),
     )
     if env_id not in MP_SOLUTIONS:
         raise RuntimeError(f"No already written motion planning solutions for {env_id}. Available options are {list(MP_SOLUTIONS.keys())}")
@@ -129,7 +136,7 @@ def main(args):
         if args.num_traj < args.num_procs:
             raise ValueError("Number of trajectories should be greater than or equal to number of processes")
         args.num_traj = args.num_traj // args.num_procs
-        seeds = [*range(0, args.num_procs * args.num_traj, args.num_traj)]
+        seeds = [*range(args.start_seed, args.start_seed + args.num_procs * args.num_traj, args.num_traj)]
         pool = mp.Pool(args.num_procs)
         proc_args = [(deepcopy(args), i, seeds[i]) for i in range(args.num_procs)]
         res = pool.starmap(_main, proc_args)
