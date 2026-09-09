@@ -73,6 +73,11 @@ class PickAndPlaceColorEnv(BaseEnv):
     tray_inner_half_size = 0.03  # half length of the tray's inner square (1 cm around the cube)
     tray_wall_thickness = 0.005
     tray_wall_height = 0.012  # height of the walls above the tray floor
+    # How far the cube's lowest corner may sit from the tray floor and still count as
+    # resting on it. Only has to cover contact penetration and settling -- a cube on the
+    # floor touches it, tilted or not -- so it is small; a cube on a wall top is 1.2 cm
+    # out, four times this.
+    tray_resting_z_tolerance = 0.003
     tray_outer_half_size = tray_inner_half_size + tray_wall_thickness
 
     # workspace bands. The panda base sits at x=-0.615, so smaller x is closer to the robot.
@@ -305,16 +310,73 @@ class PickAndPlaceColorEnv(BaseEnv):
         )
         return (clear_of_table | is_grasped | is_placed).bool()
 
+    def _cube_lowest_z(self, cube):
+        """World height of the lowest of the cube's eight corners.
+
+        Whatever the cube's orientation, this is the point it would be resting on, which
+        is what "sitting on the tray floor" is really about. Derived from the pose rather
+        than from a contact query so it is well defined on the very first frame of an
+        episode, before the physics has stepped -- `start_stage` resets place cubes
+        directly into their trays and must read as delivered straight away.
+        """
+        rotation = cube.pose.to_transformation_matrix()[..., :3, :3]
+        # the eight corners of the cube in its own frame
+        signs = torch.tensor(
+            [
+                [sx, sy, sz]
+                for sx in (-1.0, 1.0)
+                for sy in (-1.0, 1.0)
+                for sz in (-1.0, 1.0)
+            ],
+            device=rotation.device,
+            dtype=rotation.dtype,
+        )
+        corners = signs * self.cube_half_size  # (8, 3)
+        # rotate every corner into the world frame and keep the height of each
+        corner_z = torch.einsum("bij,cj->bci", rotation, corners)[..., 2]
+        return cube.pose.p[..., 2] + corner_z.min(dim=1).values
+
     def _cube_in_tray(self, cube, tray):
-        """A cube counts as placed when it sits on the tray floor, within the tray walls,
-        is at rest, and is no longer held by the robot."""
+        """A cube counts as placed when it rests on the tray floor, within the tray walls,
+        is at rest, and is no longer held by the robot.
+
+        "On the floor" is measured from the cube's *lowest corner*, not its centre. A cube
+        dropped into a tray often ends up leaning on a wall -- the inner square is 6 cm and
+        the cube 4 cm, so there is room to tilt -- and a tilted cube's centre rides up: a
+        35-degree lean lifts it 6.4 mm, and balanced on an edge it would be 8.3 mm. Those
+        are real placements, and the criterion must accept them, because it is also what
+        the recorded datasets were generated against.
+
+        Centre height cannot do that job. Rejecting a cube perched on the rim (walls stand
+        1.2 cm above a floor whose top face is 1 cm up) means a tolerance under 1.2 cm,
+        while accepting a legitimately tilted one means a tolerance over 8 mm -- the two
+        overlap, and a threshold in between separates them only by luck. Getting it wrong
+        in either direction is costly: too loose and a rim cube counts as delivered, then
+        topples, and an automatic DAgger run reads the loss as a regression and calls the
+        expert back for a stage it was told was finished; too tight and a genuine placement
+        never registers, `success` never fires, and the episode runs forever.
+
+        The lowest corner does separate them, because it is the thing actually in contact.
+        Tilted or flat, a cube resting on the tray floor has its lowest corner *at* the
+        floor; one perched on the rim has its lowest corner 1.2 cm higher, whatever its
+        centre is doing. So this asks the question directly, and the tolerance only has to
+        cover contact penetration and settling rather than adjudicating between the two.
+
+        A pairwise contact-force test says the same thing, and was tried and dropped for
+        two reasons: the tray is one actor, so its walls and its floor are indistinguishable
+        to a contact query -- a rim cube touches the tray too -- and contact forces are zero
+        until the physics has stepped, so a `start_stage` episode beginning with cubes
+        already delivered reported them unplaced on its first frame."""
         offset = cube.pose.p - tray.pose.p
         # the cube center must stay inside the tray's inner square
         margin = self.tray_inner_half_size - self.cube_half_size
         xy_flag = torch.max(torch.abs(offset[..., :2]), dim=1).values <= margin
-        # resting on the tray floor
-        resting_z = 2 * self.tray_wall_thickness + self.cube_half_size
-        z_flag = torch.abs(offset[..., 2] - resting_z) <= 0.01
+        # the cube's lowest corner must sit on the tray floor, not on a wall top
+        floor_top_z = tray.pose.p[..., 2] + 2 * self.tray_wall_thickness
+        z_flag = (
+            torch.abs(self._cube_lowest_z(cube) - floor_top_z)
+            <= self.tray_resting_z_tolerance
+        )
         is_static = cube.is_static(lin_thresh=1e-2, ang_thresh=0.5)
         is_grasped = self.agent.is_grasping(cube)
         return (xy_flag & z_flag & is_static & ~is_grasped).bool(), is_grasped
@@ -333,16 +395,35 @@ class PickAndPlaceColorEnv(BaseEnv):
             placed.append(is_placed)
             picked.append(is_picked)
         info["num_placed"] = torch.stack(placed, dim=1).sum(dim=1)
-        # the six stages, in order: pick red, place red, pick green, place green,
-        # pick blue, place blue
-        info["num_stages"] = torch.stack(picked + placed, dim=1).sum(dim=1)
+        # The six stages, in order: pick red, place red, pick green, place green, pick
+        # blue, place blue -- and "in order" is enforced, not just described. The count is
+        # the length of the leading run of completed stages, so work done out of sequence
+        # scores nothing until everything before it is finished: a red cube left balanced
+        # on its tray rim holds the count at 1 however much of green and blue follows.
+        #
+        # It used to be a plain sum over all six flags, which made the order in the
+        # sentence above a fiction. That matters to more than the score. An automatic
+        # DAgger run reads this count to decide whether the policy is getting anywhere,
+        # and an unordered sum says yes to a policy that has abandoned red and moved on --
+        # so the failure that most needs correcting was the one that never triggered one.
+        #
+        # cumprod is zero from the first incomplete stage onwards, so summing it counts
+        # exactly that leading run. Still a function of the current state alone, so the
+        # reward stays Markovian: put the red cube back in its tray and the points for
+        # green and blue come back with it.
+        ordered = torch.stack(
+            [flag for pair in zip(picked, placed) for flag in pair], dim=1
+        )
+        info["num_stages"] = torch.cumprod(ordered.long(), dim=1).sum(dim=1)
         info["success"] = placed[0] & placed[1] & placed[2]
         return info
 
     def compute_sparse_reward(self, obs, action: torch.Tensor, info: dict):
         """The task is scored as six stages worth one point each -- pick red, place red,
         pick green, place green, pick blue, place blue -- so the reward runs 0 to 6 and
-        steps up once per stage completed.
+        steps up once per stage completed, *in that order*: a stage pays only once every
+        stage before it is complete, so a cube delivered out of turn earns nothing until
+        the ones ahead of it are done.
 
         Picking a colour stays earned once that cube is in its tray (see _cube_picked),
         so a completed colour is always worth its full 2 points and the reward is a

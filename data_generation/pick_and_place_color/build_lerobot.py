@@ -41,7 +41,7 @@ DEFAULT_H5 = (
     "/home/kelin/dataset/maniskill/pick_place_color/PickAndPlaceColor-v1/"
     "motionplanning/trajectory.h5"
 )
-DEFAULT_OUT = "/home/kelin/.cache/huggingface/lerobot/recast-robotics/pick-color-cube-600"
+DEFAULT_OUT = "/home/kelin/.cache/huggingface/lerobot/recast-robotics/pick-color-cube-5000-mixed"
 
 
 def parse_args():
@@ -70,6 +70,14 @@ def parse_args():
     # cannot be avoided by using smaller shards. Writing synchronously removes the queue
     # and holds memory flat at ~3.5 GB for no measurable loss in throughput.
     p.add_argument("--image-writer-threads", type=int, default=0)
+    p.add_argument(
+        "--render-backend",
+        default=None,
+        help="Rendering device passed to gym.make, e.g. 'cpu' to rasterise in software. "
+        "Left unset ManiSkill picks the GPU, which is what you want; 'cpu' together with "
+        "VK_ICD_FILENAMES pointing at lavapipe is the fallback when GPU Vulkan is "
+        "unavailable, at roughly 85 ms per frame against ~6 ms.",
+    )
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
@@ -130,6 +138,7 @@ def main() -> None:
         control_mode="pd_joint_pos",
         render_mode="rgb_array",
         sim_backend="physx_cpu",
+        **({"render_backend": args.render_backend} if args.render_backend else {}),
         num_envs=1,
         sensor_configs=dict(width=args.width, height=args.height),
     )

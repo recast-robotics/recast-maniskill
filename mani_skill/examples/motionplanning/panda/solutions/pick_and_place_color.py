@@ -229,6 +229,13 @@ def solve(env: PickAndPlaceColorEnv, seed=None, debug=False, vis=False, options=
         for i, color_name in enumerate(env.COLORS)
         if not bool(info[f"is_{color_name}_placed"][0])
     ]
+    # A cube already in the gripper is delivered first. Offline this never
+    # fires -- nothing is grasped at reset -- but the solution is also run
+    # live as a DAgger takeover, picking up from wherever the policy left the
+    # arm. There the gripper may already hold, say, blue while green is still
+    # on the table: leaving the list in colour order would carry blue to
+    # green's tray. sort() is stable, so the rest keeps its colour order.
+    todo.sort(key=lambda i: not bool(info[f"is_{list(env.COLORS)[i]}_grasped"][0]))
     if not todo:  # already solved at reset; nothing to do
         planner.close()
         return env.step(env.agent.robot.get_qpos()[0, :-1].cpu().numpy())
