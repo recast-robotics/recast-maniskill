@@ -16,9 +16,11 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 # HF_LEROBOT_HOME layout, so LeRobotDataset(DST_REPO_ID) finds it with no root= and
 # no download.
-ROOT = Path("/home/kelin/.cache/huggingface/lerobot/recast-robotics/pick-color-cube-600")
-SRC_REPO_ID = "maniskill/pick_place_color"
-DST_REPO_ID = "recast-robotics/pick-color-cube-600"
+ROOT = Path("/home/kelin/.cache/huggingface/lerobot/recast-robotics/pick-color-cube-5000-mixed")
+# Only a label: LeRobotDataset reads meta/info.json from --root and never consults
+# the Hub while it is present, so this just has to be stable, not resolvable.
+SRC_REPO_ID = "recast-robotics/pick-color-cube-5000-mixed"
+DST_REPO_ID = "recast-robotics/pick-color-cube-5000-mixed"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--public", action="store_true", help="create a public repo instead of private")
@@ -32,7 +34,7 @@ info_path = args.root / "meta" / "info.json"
 if not info_path.is_file():
     raise SystemExit(
         f"No LeRobot dataset at {args.root} (missing {info_path}).\n"
-        "Build it first with data_generation/pick_place_color/build_lerobot.py."
+        "Build it first with data_generation/pick_and_place_color/build_lerobot.py."
     )
 
 ds = LeRobotDataset(SRC_REPO_ID, root=args.root, video_backend="pyav")

@@ -61,7 +61,7 @@ Output: `PickAndPlaceColor-v1/motionplanning/trajectory.h5` (env states + action
 ## 2. LeRobot dataset
 
 ```bash
-python data_generation/pick_place_color/build_lerobot.py
+python data_generation/pick_and_place_color/build_lerobot.py
 ```
 
 Replays every recorded frame by environment state and re-renders `base_camera` and
@@ -75,7 +75,7 @@ episode, which is why the source h5 stays observation-free and the images live i
 
 ```bash
 for i in 0 1 2 3; do
-  python data_generation/pick_place_color/build_lerobot.py \
+  python data_generation/pick_and_place_color/build_lerobot.py \
       --num-shards 4 --shard $i --shard-mode block \
       --repo-id "maniskill/pick_place_color_s$i" \
       --out "$SHARDS_TMP/s$i" --overwrite &
@@ -102,7 +102,7 @@ print its `DONE` line before merging -- a merge over a silently truncated shard 
 dataset that looks valid but is missing episodes. Verify after merging:
 
 ```python
-ds = LeRobotDataset("recast-robotics/pick-color-cube-600")
+ds = LeRobotDataset("recast-robotics/pick-color-cube-5000-mixed")
 assert ds.num_frames == sum(e["elapsed_steps"] for e in json.load(open(H5_JSON))["episodes"])
 ```
 
@@ -120,11 +120,11 @@ shards, so the merged `episode_index` no longer matches the source trajectory in
 ## 3. Upload to the Hub
 
 ```bash
-python data_generation/pick_place_color/upload_to_hub.py          # private
-python data_generation/pick_place_color/upload_to_hub.py --public
+python data_generation/pick_and_place_color/upload_to_hub.py          # private
+python data_generation/pick_and_place_color/upload_to_hub.py --public
 ```
 
-Pushes to `recast-robotics/pick-color-cube-600` with videos, a LeRobot dataset card and
+Pushes to `recast-robotics/pick-color-cube-5000-mixed` with videos, a LeRobot dataset card and
 the `v3.0` codebase tag. Uses `upload_large_folder=True` so a ~14 GB push resumes rather
 than restarting after a network drop.
 
@@ -134,12 +134,12 @@ than restarting after a network drop.
 | What | Where |
 |---|---|
 | Motion-planning source | `/home/kelin/dataset/maniskill/pick_place_color/PickAndPlaceColor-v1/motionplanning/trajectory.h5` |
-| LeRobot dataset | `~/.cache/huggingface/lerobot/recast-robotics/pick-color-cube-600` |
-| Hub (private) | `recast-robotics/pick-color-cube-600` |
+| LeRobot dataset | `~/.cache/huggingface/lerobot/recast-robotics/pick-color-cube-5000-mixed` |
+| Hub (private) | `recast-robotics/pick-color-cube-5000-mixed` |
 
 The LeRobot dataset lives under `HF_LEROBOT_HOME`, so it loads with no `root=` argument
 and no download:
 
 ```python
-LeRobotDataset("recast-robotics/pick-color-cube-600")
+LeRobotDataset("recast-robotics/pick-color-cube-5000-mixed")
 ```
