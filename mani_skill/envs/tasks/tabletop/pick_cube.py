@@ -44,7 +44,7 @@ class attribute and can be reverted to the upstream default:
   solutions, reward terms and simulation-state tests are unaffected. Set to ``True``
   to restore the upstream green sphere.
 - `sensor_camera_resolution`: resolution of `base_camera`.
-- the default robot is `panda_wristcam`, which adds a wrist-mounted `hand_camera`
+- the default robot is `panda_wristcam`, which adds a wrist-mounted `wrist_camera`
   alongside `base_camera`. Pass ``robot_uids="panda"`` for the upstream single-camera setup.
 
 Note that the cube is only resized when the environment reconfigures. Pass
@@ -101,7 +101,7 @@ class PickCubeEnv(BaseEnv):
         if robot_uids == "panda_wristcam":
             sensor_configs = dict(kwargs.pop("sensor_configs", None) or {})
             width, height = self.sensor_camera_resolution
-            sensor_configs.setdefault("hand_camera", dict(width=width, height=height))
+            sensor_configs.setdefault("wrist_camera", dict(width=width, height=height))
             kwargs["sensor_configs"] = sensor_configs
 
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
